@@ -21,7 +21,8 @@ pi.dev/packages **不是一个上传入口**，它是 npm 的索引：
 | `pi-package` 关键词 | ✅ 已有 |
 | `pi` manifest | ✅ 已声明 `extensions` + `changelogPath` |
 | npm 登录 | ❌ 未登录（`npm whoami` → `ENEEDAUTH`） |
-| GitHub 仓库 | ❌ 不存在（`repository` 字段已暂时移除，建好仓库后再加回） |
+| GitHub 仓库 | ✅ `https://github.com/hbj4080/pi-session-history-sidebar`（`main`，已推送） |
+| `repository` / `homepage` / `bugs` | ✅ 已指向该仓库 |
 
 ## 1. 登录 npm
 
@@ -32,20 +33,24 @@ npm whoami           # 应打印你的用户名
 
 没有账号就先在 <https://www.npmjs.com/signup> 注册（邮箱验证 + 开 2FA 更安全）。
 
-## 2. 补全元数据（建议）
+## 2. 元数据（已完成）
 
-创建 GitHub 仓库后，把 `repository` / `homepage` / `bugs` 加回 `package.json`：
+`package.json` 已包含：
 
 ```json
-"repository": { "type": "git", "url": "git+https://github.com/Hamburman/pi-session-history-sidebar.git" },
-"homepage": "https://github.com/Hamburman/pi-session-history-sidebar#readme",
-"bugs": { "url": "https://github.com/Hamburman/pi-session-history-sidebar/issues" }
+"author": "Hamburman (hbj4080)",
+"repository": { "type": "git", "url": "git+https://github.com/hbj4080/pi-session-history-sidebar.git" },
+"homepage": "https://github.com/hbj4080/pi-session-history-sidebar#readme",
+"bugs": { "url": "https://github.com/hbj4080/pi-session-history-sidebar/issues" }
 ```
 
-可选（会显示在 gallery 卡片上）：`pi.image` / `pi.video` 指向一张公网可访问的预览图，例如
+可选补强（在 GitHub 网页上操作，或装上 `gh` CLI）：
+
+- 仓库 **About** 里填一句 description、加上 topics：`pi-package`、`pi-extension`、`pi`、`tui`
+- gallery 卡片预览图：`pi.image` 指向公网可访问的 PNG，例如
 
 ```json
-"pi": { "extensions": ["..."], "image": "https://raw.githubusercontent.com/Hamburman/pi-session-history-sidebar/main/docs/preview.png" }
+"pi": { "extensions": ["..."], "image": "https://raw.githubusercontent.com/hbj4080/pi-session-history-sidebar/main/docs/preview.png" }
 ```
 
 ## 3. 检查打包内容
