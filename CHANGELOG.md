@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.1] - 2026-11-17
+
+Fixed — jumping to a message now works on transcripts that carry no `messageId`.
+
+- pi only tags message components with `messageId` when it re-renders the chat (e.g. after
+  a compaction); messages appended live have no id, so every jump used to report
+  "这条消息已不在当前上下文中".
+- Jump resolution now cascades: `messageId` → component order (branch order matches the
+  panel list) → rendered-text match. No `messageId` is required anymore.
+- `/history-debug` reports both counts (`按 id 定位` / `按顺序候选`) and writes a tree dump
+  to `~/.pi/agent/session-history-sidebar.log`. Set `PI_HISTORY_LOG` to relocate the log.
+
 ## [0.1.0] - 2026-11-17
 
 首个版本。

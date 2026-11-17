@@ -21,6 +21,9 @@
  * viewport to move, so the panel then explains that instead of jumping.
  */
 
+import { appendFileSync, existsSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join as joinPath } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -45,6 +48,25 @@ interface SidebarTheme {
 
 // Access to pi-tui internals that are not part of the public extension surface.
 type AnyTui = any;
+
+// ---------------------------------------------------------------------------
+// diagnostics
+// ---------------------------------------------------------------------------
+
+const LOG_PATH = process.env.PI_HISTORY_LOG ?? joinPath(homedir(), ".pi", "agent", "session-history-sidebar.log");
+
+function logDebug(lines: string[]): void {
+	try {
+		if (existsSync(LOG_PATH) && statSync(LOG_PATH).size > 512 * 1024) writeFileSync(LOG_PATH, "");
+		appendFileSync(LOG_PATH, `\n=== ${new Date().toISOString()} ===\n${lines.join("\n")}\n`);
+	} catch {
+		// Diagnostics must never break the panel.
+	}
+}
+
+function kindOf(node: any): string {
+	return node?.constructor?.name ?? typeof node;
+}
 
 // ---------------------------------------------------------------------------
 // session data
@@ -129,9 +151,19 @@ function collectItems(ctx: ExtensionCommandContext): HistoryItem[] {
 // transcript geometry
 // ---------------------------------------------------------------------------
 
+interface OffsetEntry {
+	y: number;
+	id?: string;
+	kind: string;
+	/** ANSI-stripped head of the rendered component, used for text-based fallback. */
+	head?: string;
+}
+
 interface OffsetState {
 	y: number;
 	offsets: Map<string, number>;
+	/** Every atomic (leaf) component in render order, with its line offset. */
+	ordered: OffsetEntry[];
 }
 
 const offsetCache = new WeakMap<object, { key: string; state: OffsetState }>();
@@ -166,13 +198,32 @@ function transcriptRect(tui: AnyTui): { top: number; height: number } | undefine
 	return { top: Math.max(0, Math.round(rect.y ?? 0)), height: Math.max(1, Math.round(rect.height ?? 0)) };
 }
 
-function heightOf(component: any, width: number): number {
+function renderLines(component: any, width: number): string[] {
 	try {
 		const lines = component?.render?.(width);
-		return Array.isArray(lines) ? lines.length : 0;
+		return Array.isArray(lines) ? lines : [];
 	} catch {
-		return 0;
+		return [];
 	}
+}
+
+function heightOf(component: any, width: number): number {
+	return renderLines(component, width).length;
+}
+
+const ANSI_PATTERN = /\u001b\[[0-9;]*[A-Za-z]/g;
+
+function headOf(lines: string[], max = 96): string {
+	return lines
+		.join(" ")
+		.replace(ANSI_PATTERN, "")
+		.replace(/\s+/g, " ")
+		.trim()
+		.slice(0, max);
+}
+
+function normalize(text: string): string {
+	return text.replace(ANSI_PATTERN, "").replace(/\s+/g, "").toLowerCase();
 }
 
 /** Cheap structural signature: new/removed components change it, streaming does not. */
@@ -201,25 +252,31 @@ function walkOffsets(node: any, width: number, state: OffsetState, depth = 0): v
 	const id = node.messageId;
 	if (typeof id === "string") {
 		if (!state.offsets.has(id)) state.offsets.set(id, state.y);
-		state.y += heightOf(node, width);
+		const lines = renderLines(node, width);
+		state.ordered.push({ y: state.y, id, kind: kindOf(node), head: headOf(lines) });
+		state.y += lines.length;
 		return;
 	}
 	const children: any[] = Array.isArray(node.children) ? node.children : [];
 	if (children.length > 0 && depth < 8) {
 		const beforeY = state.y;
 		const beforeKeys = new Set(state.offsets.keys());
+		const beforeOrdered = state.ordered.length;
 		for (const child of children) walkOffsets(child, width, state, depth + 1);
 		const own = heightOf(node, width);
 		if (state.y - beforeY === own) return; // transparent container
 		for (const key of [...state.offsets.keys()]) if (!beforeKeys.has(key)) state.offsets.delete(key);
+		state.ordered.length = beforeOrdered;
+		state.ordered.push({ y: beforeY, kind: kindOf(node) });
 		state.y = beforeY + own;
 		return;
 	}
+	state.ordered.push({ y: state.y, kind: kindOf(node), head: headOf(renderLines(node, width)) });
 	state.y += heightOf(node, width);
 }
 
 function scanTranscript(document: any, width: number): OffsetState {
-	const state: OffsetState = { y: 0, offsets: new Map<string, number>() };
+	const state: OffsetState = { y: 0, offsets: new Map<string, number>(), ordered: [] };
 	if (!document) return state;
 	const key = `${treeSize(document)}@${width}`;
 	const cached = offsetCache.get(document);
@@ -237,26 +294,122 @@ function computeOffsets(document: any, width: number): Map<string, number> {
 interface JumpResult {
 	ok: boolean;
 	reason?: string;
+	how?: string;
 }
 
-function jumpToItem(tui: AnyTui, item: HistoryItem): JumpResult {
+const JUMPABLE = new Set<HistoryItem["kind"]>(["user", "assistant", "summary"]);
+
+/**
+ * Candidates for order-based fallback.
+ *
+ * Preference is given to real message components (by constructor name), but any
+ * component that carries a `messageId` is also a valid target.
+ */
+function messageTargets(scan: OffsetState): OffsetEntry[] {
+	return scan.ordered.filter((entry) => entry.id !== undefined || /MessageComponent$/.test(entry.kind));
+}
+
+/** Does the rendered head of `entry` contain (a prefix of) the item's text? */
+function matchesText(entry: OffsetEntry | undefined, needle: string): boolean {
+	if (!entry || !needle) return false;
+	const head = normalize(entry.head ?? "");
+	if (!head) return false;
+	return head.includes(needle) || needle.includes(head.slice(0, 12));
+}
+
+/**
+ * Choose the component that corresponds to `item` without relying on `messageId`.
+ *
+ * The panel list and the transcript share the same branch order, so the item's index
+ * is the primary guess. When the rendered text confirms it (or a neighbour confirms
+ * it), that guess is trusted; otherwise it is only used as an approximation.
+ */
+function pickCandidate(targets: OffsetEntry[], item: HistoryItem, slot: number, total: number): { y: number; how: string } | undefined {
+	if (slot < 0 || targets.length === 0) return undefined;
+	const needle = normalize(item.text).slice(0, 16);
+	const exact = targets.length === total ? "order" : "order-approx";
+	const direct = targets[slot];
+	if (!needle || matchesText(direct, needle)) return { y: direct?.y ?? targets[targets.length - 1].y, how: exact };
+	for (let delta = 1; delta <= 4; delta += 1) {
+		for (const index of [slot - delta, slot + delta]) {
+			if (matchesText(targets[index], needle)) return { y: targets[index].y, how: "text" };
+		}
+	}
+	return { y: direct?.y ?? targets[targets.length - 1].y, how: "order-approx" };
+}
+
+function describeTree(document: any, width: number, limit = 80): string[] {
+	const lines: string[] = [];
+	const visit = (node: any, depth: number): void => {
+		if (!node || lines.length >= limit) return;
+		const children: any[] = Array.isArray(node.children) ? node.children : [];
+		const id = typeof node.messageId === "string" ? node.messageId.slice(0, 8) : "-";
+		lines.push(`${"  ".repeat(depth)}${kindOf(node)} children=${children.length} id=${id} h=${heightOf(node, width)}`);
+		if (depth < 6) for (const child of children) visit(child, depth + 1);
+	};
+	visit(document, 0);
+	return lines;
+}
+
+let loggedFallback = false;
+
+function jumpToItem(tui: AnyTui, item: HistoryItem, siblings: HistoryItem[] = []): JumpResult {
 	const { scroll, document } = resolveTranscript(tui);
 	if (!scroll || !document) {
 		return { ok: false, reason: "当前不是全屏模式，无法滚动定位" };
 	}
 	const terminalWidth = tui?.terminal?.columns ?? 80;
 	const width = typeof scroll.getContentWidth === "function" ? scroll.getContentWidth(terminalWidth) : terminalWidth;
-	const offsets = computeOffsets(document, width);
-	const offset = offsets.get(item.id);
+	const scan = scanTranscript(document, width);
+	let offset = scan.offsets.get(item.id);
+	let how = "id";
 	if (offset === undefined) {
+		// pi only tags message components with `messageId` when it knows the entry id.
+		// Older/newer builds may not, so fall back to render order: both the panel list
+		// and the transcript are ordered by branch position.
+		const targets = messageTargets(scan);
+		const jumpable = siblings.length > 0 ? siblings.filter((entry) => JUMPABLE.has(entry.kind)) : [];
+		const slot = jumpable.indexOf(item);
+		if (targets.length > 0) {
+			const candidate = pickCandidate(targets, item, slot, jumpable.length);
+			if (candidate) {
+				offset = candidate.y;
+				how = candidate.how;
+			}
+		} else {
+			// Neither ids nor message-component names are available: fall back to a
+			// pure text search over every rendered leaf.
+			const needle = normalize(item.text).slice(0, 16);
+			const hit = scan.ordered.find((entry) => (entry.head ?? "").length > 0 && matchesText(entry, needle));
+			if (hit) {
+				offset = hit.y;
+				how = "text-any";
+			}
+		}
+	}
+	if (offset === undefined) {
+		logDebug([
+			`MISS id=${item.id} kind=${item.kind} time=${item.time}`,
+			`width=${width} y=${scan.y} offsets=${scan.offsets.size} ordered=${scan.ordered.length} targets=${messageTargets(scan).length}`,
+			`items=${siblings.length} jumpable=${siblings.filter((entry) => JUMPABLE.has(entry.kind)).length}`,
+			`scrollChild=${kindOf(scroll?.child)} docChildren=${document?.children?.length ?? 0}`,
+			...describeTree(document, width),
+		]);
 		return { ok: false, reason: "这条消息已不在当前上下文中（可能被压缩或不在当前分支）" };
+	}
+	if (how !== "id" && !loggedFallback) {
+		loggedFallback = true;
+		logDebug([
+			`FALLBACK ${how} id=${item.id} offset=${offset} offsets=${scan.offsets.size} targets=${messageTargets(scan).length}`,
+			...describeTree(document, width, 24),
+		]);
 	}
 	scroll.scrollTo(Math.max(0, offset - 1), { disableFollow: true });
 	if (typeof tui.flash === "function") {
 		tui.flash(`↪ ${item.role} ${item.time} · ${item.preview}`);
 	}
 	tui.requestRender?.();
-	return { ok: true };
+	return { ok: true, how };
 }
 
 // ---------------------------------------------------------------------------
@@ -627,7 +780,7 @@ export default function sessionHistorySidebar(pi: ExtensionAPI) {
 					let component: HistorySidebar | undefined;
 					const pick = (item: HistoryItem) => {
 						if (closed) return;
-						const result = jumpToItem(tui, item);
+						const result = jumpToItem(tui, item, getItems());
 						if (!result.ok) ctx.ui.notify(result.reason ?? "无法定位这条消息", "warning");
 					};
 					const blur = () => {
@@ -711,13 +864,20 @@ export default function sessionHistorySidebar(pi: ExtensionAPI) {
 					const { scroll, document } = resolveTranscript(tui);
 					const terminalWidth = tui?.terminal?.columns ?? 80;
 					const width = scroll && typeof scroll.getContentWidth === "function" ? scroll.getContentWidth(terminalWidth) : terminalWidth;
-					const scan = document ? scanTranscript(document, width) : { y: 0, offsets: new Map<string, number>() };
+					const scan = document ? scanTranscript(document, width) : { y: 0, offsets: new Map<string, number>(), ordered: [] };
 					const located = items.filter((item) => scan.offsets.has(item.id)).length;
+					const targets = messageTargets(scan).length;
 					const actual = document ? heightOf(document, width) : 0;
-					const missing = items.filter((item) => !scan.offsets.has(item.id)).map((item) => `${item.role}@${item.time}`).slice(0, 6);
+					const missing = items.filter((item) => !scan.offsets.has(item.id)).map((item) => `${item.role}@${item.time}`).slice(0, 4);
+					logDebug([
+						`DEBUG items=${items.length} located=${located} targets=${targets} width=${width} y=${scan.y} actual=${actual}`,
+						`ids=${items.slice(0, 4).map((item) => `${item.id.slice(0, 8)}:${item.kind}`).join(",")}`,
+						...describeTree(document, width),
+					]);
 					ctx.ui.notify(
-						`历史 ${items.length} 条 · 可定位 ${located} 条 · 行高 计算 ${scan.y}/实际 ${actual} · 滚动视图 ${scroll ? "有" : "无"} · 宽 ${width}` +
-							(missing.length ? ` · 缺: ${missing.join(", ")}` : ""),
+						`历史 ${items.length} 条 · 按 id 定位 ${located} 条 · 按顺序候选 ${targets} 个 · 行高 计算 ${scan.y}/实际 ${actual} · 滚动视图 ${scroll ? "有" : "无"} · 宽 ${width}` +
+							(missing.length ? ` · 无 id: ${missing.join(", ")}` : "") +
+							` · 日志 ${LOG_PATH}`,
 						"info",
 					);
 					done();

@@ -1,6 +1,6 @@
 {
   "name": "pi-session-history-sidebar",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Right-hand session history sidebar for pi: browse, search and jump to any earlier message in the current session.",
   "keywords": [
     "pi-package",
