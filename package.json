@@ -1,0 +1,45 @@
+{
+  "name": "pi-session-history-sidebar",
+  "version": "0.1.0",
+  "description": "Right-hand session history sidebar for pi: browse, search and jump to any earlier message in the current session.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "session",
+    "history",
+    "sidebar",
+    "tui"
+  ],
+  "license": "MIT",
+  "author": "Hamburman (hbj4080)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hbj4080/pi-session-history-sidebar.git"
+  },
+  "homepage": "https://github.com/hbj4080/pi-session-history-sidebar#readme",
+  "bugs": {
+    "url": "https://github.com/hbj4080/pi-session-history-sidebar/issues"
+  },
+  "type": "module",
+  "files": [
+    "extensions/",
+    "README.md",
+    "CHANGELOG.md",
+    "PUBLISHING.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/session-history-sidebar.ts"
+    ],
+    "changelogPath": "./CHANGELOG.md"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
